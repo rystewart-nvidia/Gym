@@ -576,6 +576,29 @@ def agent_key(agent_server_module: str) -> str:
     return key
 
 
+def resolve_agent_source_dir(agent_server_module: str) -> Path:
+    """Resolve an agent package with normal Python path precedence, without importing it."""
+    key = agent_key(agent_server_module)
+    parts = agent_server_module.split(".")
+    relative_app = Path(*parts[:-1]) / f"{parts[-1]}.py"
+    for entry in sys.path:
+        root = Path(entry or os.getcwd()).resolve()
+        candidate = root / relative_app
+        if not candidate.exists():
+            continue
+        source = candidate.parent
+        if candidate.is_symlink() or source.is_symlink() or not candidate.is_file():
+            raise LegalAgentBenchConfigurationError(
+                f"Configured Gym agent source must be a regular, non-symlink package: {source}"
+            )
+        if source.name != key:
+            raise LegalAgentBenchConfigurationError(
+                f"Configured Gym agent source does not match module key {key!r}: {source}"
+            )
+        return source
+    raise LegalAgentBenchConfigurationError(f"Configured Gym agent source not found: {agent_server_module}")
+
+
 def _results_segment(value: str, *, fallback: str) -> str:
     segment = "".join(
         character if character.isascii() and (character.isalnum() or character in "._-") else "-"
@@ -603,10 +626,11 @@ def _results_session_dir(
 
 def resolve_agent_setup_script(agent_server_module: str) -> Path:
     key = agent_key(agent_server_module)
-    script = PARENT_DIR / "responses_api_agents" / key / "scripts" / f"{key}_deps.sh"
-    if not script.is_file():
+    source = resolve_agent_source_dir(agent_server_module)
+    script = source / "scripts" / f"{key}_deps.sh"
+    if script.is_symlink() or not script.is_file():
         raise LegalAgentBenchConfigurationError(
-            f"Configurable LAB agent {key!r} requires dependency setup script {script.relative_to(PARENT_DIR)}"
+            f"Configurable LAB agent {key!r} requires dependency setup script as a regular file at {script}"
         )
     return script
 
@@ -652,7 +676,11 @@ def _runtime_recipe(
 ) -> tuple[str, Path, dict[str, str]]:
     key = agent_key(agent_server_module)
     script = resolve_agent_setup_script(agent_server_module)
-    requirements = PARENT_DIR / "responses_api_agents" / key / "requirements.txt"
+    requirements = resolve_agent_source_dir(agent_server_module) / "requirements.txt"
+    if requirements.is_symlink() or not requirements.is_file():
+        raise LegalAgentBenchConfigurationError(
+            f"Configurable LAB agent {key!r} requires a regular requirements file at {requirements}"
+        )
     runtime_env = agent_runtime_env(agent_server_module, agent_kwargs)
     recipe = _recipe_hash(
         [
@@ -674,7 +702,7 @@ def _runtime_recipe(
 
 def _create_runtime_builder_input(destination: Path, agent_server_module: str, script: Path) -> None:
     key = agent_key(agent_server_module)
-    requirements = PARENT_DIR / "responses_api_agents" / key / "requirements.txt"
+    requirements = resolve_agent_source_dir(agent_server_module) / "requirements.txt"
     _create_archive(
         destination,
         [
@@ -1246,9 +1274,7 @@ class LegalAgentBenchAgent(SimpleResponsesAPIAgent):
 
     def _stage_agent_source(self, paths: dict[str, Path]) -> None:
         key = agent_key(self.config.agent_server_module)
-        source = PARENT_DIR / "responses_api_agents" / key
-        if not source.is_dir():
-            raise LegalAgentBenchConfigurationError(f"Configured Gym agent source not found: {source}")
+        source = resolve_agent_source_dir(self.config.agent_server_module)
         destination = paths["agent_source"] / "responses_api_agents" / key
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(
@@ -1259,6 +1285,9 @@ class LegalAgentBenchAgent(SimpleResponsesAPIAgent):
                 ".pytest_cache",
                 ".venv",
                 ".deps",
+                ".env",
+                "env.yaml",
+                ".git",
                 ".claude_node",
                 ".codex_node",
                 "configs",

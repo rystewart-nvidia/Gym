@@ -134,6 +134,7 @@ def _runtime_sources(monkeypatch, tmp_path: Path, key: str, script_text: str = "
     monkeypatch.setattr(app, "PACKAGE_DIR", package_dir)
     monkeypatch.setattr(app, "PARENT_DIR", tmp_path)
     monkeypatch.setattr(app, "PORTABLE_PYTHON_SH", portable)
+    monkeypatch.syspath_prepend(str(tmp_path))
     monkeypatch.setattr(app, "resolve_agent_setup_script", lambda _module: script)
     return package_dir, script
 
@@ -200,6 +201,36 @@ def test_all_supported_agents_have_dependency_scripts() -> None:
         "responses_api_agents.codex_agent.app",
     ):
         assert app.resolve_agent_setup_script(module).is_file()
+
+
+def test_external_agent_source_and_runtime_files_follow_python_path(monkeypatch, tmp_path) -> None:
+    external_root = tmp_path / "external"
+    source = external_root / "responses_api_agents" / "external_agent"
+    (source / "scripts").mkdir(parents=True)
+    (source / "tests").mkdir()
+    (source / "app.py").write_text("VALUE = 1\n")
+    (source / "__init__.py").write_text("")
+    (source / "requirements.txt").write_text("nemo-gym\n")
+    setup_script = source / "scripts" / "external_agent_deps.sh"
+    setup_script.write_text("#!/bin/bash\n")
+    (source / "tests" / "test_external.py").write_text("raise AssertionError\n")
+    (source / ".env").write_text("API_KEY=credential-fixture\n")  # pragma: allowlist secret
+    (source / "env.yaml").write_text("api_key: credential-fixture\n")  # pragma: allowlist secret
+    monkeypatch.syspath_prepend(str(external_root))
+    module = "responses_api_agents.external_agent.app"
+
+    assert app.resolve_agent_source_dir(module) == source
+    assert app.resolve_agent_setup_script(module) == setup_script
+
+    runner = app.LegalAgentBenchAgent.model_construct(config=_config(agent_server_module=module))
+    paths = runner._paths_for_root(tmp_path / "run", create=True)
+    runner._stage_agent_source(paths)
+    staged = paths["agent_source"] / "responses_api_agents" / "external_agent"
+    assert (staged / "app.py").read_text() == "VALUE = 1\n"
+    assert not (staged / "scripts").exists()
+    assert not (staged / "tests").exists()
+    assert not (staged / ".env").exists()
+    assert not (staged / "env.yaml").exists()
 
 
 @pytest.mark.asyncio
@@ -371,9 +402,12 @@ def test_provider_and_installer_validation_rejects_ambiguous_or_missing_configur
     with pytest.raises(app.LegalAgentBenchConfigurationError, match="exactly one provider"):
         app._provider_name({"docker": {}, "ecs_fargate": {}})
 
-    monkeypatch.setattr(app, "PARENT_DIR", tmp_path)
+    missing_source = tmp_path / "responses_api_agents" / "missing_agent"
+    missing_source.mkdir(parents=True)
+    (missing_source / "app.py").write_text("")
+    monkeypatch.syspath_prepend(str(tmp_path))
     with pytest.raises(app.LegalAgentBenchConfigurationError, match="requires dependency setup script"):
-        app.resolve_agent_setup_script("responses_api_agents.hermes_agent.app")
+        app.resolve_agent_setup_script("responses_api_agents.missing_agent.app")
 
     runner = app.LegalAgentBenchAgent.model_construct(
         config=_config(sandbox_provider="sandbox"),
@@ -853,7 +887,7 @@ def test_stage_agent_source_copies_only_selected_runtime_package(monkeypatch, tm
     paths = {"agent_source": tmp_path / "staged"}
     paths["agent_source"].mkdir()
     runner = app.LegalAgentBenchAgent.model_construct(config=_config())
-    monkeypatch.setattr(app, "PARENT_DIR", repository)
+    monkeypatch.syspath_prepend(str(repository))
 
     runner._stage_agent_source(paths)
 
