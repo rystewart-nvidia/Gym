@@ -32,7 +32,7 @@ import requests
 import rich
 import uvicorn
 from devtools import pprint
-from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from pydantic import Field
 from rich.table import Table
 from tqdm.auto import tqdm
@@ -99,6 +99,7 @@ from nemo_gym.telemetry.setup import (
 _GRACEFUL_SHUTDOWN_TIMEOUT_SEC: int = 1
 # Grace period after SIGKILL for the kernel to reap the child and avoid <defunct> entries.
 _FORCE_KILL_REAP_TIMEOUT_SEC: int = 2
+_SCRUB_ENV_VARS_ENV_VAR_NAME = "NEMO_GYM_SCRUB_ENV_VARS"
 
 
 # Model servers name their upstream endpoint inconsistently: `openai_base_url` (openai_model,
@@ -380,6 +381,32 @@ def _server_process_command_and_env(
     }
 
 
+def _resolve_config_and_scrub_environment(
+    global_config_dict: DictConfig,
+) -> tuple[DictConfig, dict[str, str]]:
+    """Resolve env interpolation, then move selected secrets out of Ray's environment."""
+    names = os.environ.pop(_SCRUB_ENV_VARS_ENV_VAR_NAME, "")
+    if not names:
+        return global_config_dict, {}
+
+    # Resolve first: server subprocesses receive the complete config through
+    # NEMO_GYM_CONFIG_DICT and no longer need the source variables themselves.
+    resolved_config = OmegaConf.create(OmegaConf.to_container(global_config_dict, resolve=True))
+    with open_dict(global_config_dict):
+        global_config_dict.clear()
+        global_config_dict.merge_with(resolved_config)
+    server_environment = {}
+    for name in names.split(","):
+        name = name.strip()
+        if not name:
+            continue
+        if not name.isidentifier():
+            raise ConfigError(f"invalid environment variable name in {_SCRUB_ENV_VARS_ENV_VAR_NAME}: {name!r}")
+        if (value := os.environ.pop(name, None)) is not None:
+            server_environment[name] = value
+    return global_config_dict, server_environment
+
+
 class RunHelper:  # pragma: no cover
     _head_server: uvicorn.Server
     _head_server_thread: Thread
@@ -395,6 +422,8 @@ class RunHelper:  # pragma: no cover
         # Fail fast before starting Ray if nothing is configured to run (covers env run and the
         # e2e rollout-collection path, which both start servers via this method).
         GlobalConfigDictParser().raise_on_no_server_instances(global_config_dict)
+
+        global_config_dict, server_environment = _resolve_config_and_scrub_environment(global_config_dict)
 
         # Translate the `telemetry:` block into NEMO_GYM_OTEL_* env vars *before* anything is
         # spawned. run_command copies os.environ into every server process, and that copy is
@@ -448,6 +477,7 @@ class RunHelper:  # pragma: no cover
                 top_level_path,
                 entrypoint_fpath,
             )
+            process_env.update(server_environment)
             process = run_command(
                 command,
                 dir_path,

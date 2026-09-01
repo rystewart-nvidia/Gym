@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
 import shlex
 import sys
 import tomllib
@@ -35,6 +36,7 @@ from nemo_gym.cli.env import (
     RunConfig,
     RunHelper,
     _delete_server_venv,
+    _resolve_config_and_scrub_environment,
     _resolve_server_dir,
     _select_shard,
     _server_process_command_and_env,
@@ -283,6 +285,38 @@ def test_server_config_is_passed_in_environment_not_process_arguments(monkeypatc
     assert secret not in command
     assert secret in environment["NEMO_GYM_CONFIG_DICT"]
     assert environment["NEMO_GYM_CONFIG_PATH"] == "policy_model"
+
+
+def test_selected_environment_secrets_are_resolved_before_ray_and_scrubbed(monkeypatch: MonkeyPatch) -> None:
+    secret = "credential-fixture"  # pragma: allowlist secret
+    monkeypatch.setenv("POLICY_API_KEY", secret)
+    monkeypatch.setenv("PROVIDER_OPTIONS", "{docker: {}}")
+    monkeypatch.setenv("UNRELATED", "preserved")
+    monkeypatch.setenv("NEMO_GYM_SCRUB_ENV_VARS", "POLICY_API_KEY")
+    config = OmegaConf.create(
+        {
+            "policy_model": {"api_key": "${oc.env:POLICY_API_KEY}"},
+            "provider_options": "${oc.decode:${oc.env:PROVIDER_OPTIONS}}",
+        }
+    )
+    OmegaConf.set_struct(config, True)
+
+    resolved_config, server_environment = _resolve_config_and_scrub_environment(config)
+
+    assert resolved_config is config
+    assert resolved_config.policy_model.api_key == secret
+    assert resolved_config.provider_options == {"docker": {}}
+    assert "POLICY_API_KEY" not in os.environ
+    assert "NEMO_GYM_SCRUB_ENV_VARS" not in os.environ
+    assert os.environ["UNRELATED"] == "preserved"
+    assert server_environment == {"POLICY_API_KEY": secret}
+
+
+def test_scrub_environment_rejects_invalid_variable_names(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("NEMO_GYM_SCRUB_ENV_VARS", "../secret")
+
+    with pytest.raises(ConfigError, match="invalid environment variable name"):
+        _resolve_config_and_scrub_environment(OmegaConf.create({}))
 
 
 class TestRunHelperDryRunSpinup:
